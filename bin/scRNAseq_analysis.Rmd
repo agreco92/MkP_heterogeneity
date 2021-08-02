@@ -1,0 +1,544 @@
+---
+title: "scRNA-seq analysis"
+output:
+  html_document:
+    df_print: paged
+    code_folding: hide
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    theme: flatly
+    highlight: zenburn
+  pdf_document: default
+editor_options:
+  chunk_output_type: inline
+---
+# Pre-processing
+```{r, echo=F}
+knitr::opts_chunk$set(echo = TRUE, warning=F,fig.width = 5.5, fig.height = 4.5, fig.align = 'center',cache=F)
+```
+
+```{r includes, message=F, warning=F, echo =F}
+#reticulate::use_condaenv("base")
+library(reticulate, quietly = T)
+use_python('/Users/greco/opt/anaconda3/bin/python',required = T)
+
+library(scran, quietly = T)
+library(scater, quietly = T)
+library(Seurat, quietly = T)
+library(batchelor, quietly = T)
+
+library(AnnotationHub, quietly = T)
+library(org.Mm.eg.db, quietly = T)
+
+library(batchelor, quietly = T)
+library(limma, quietly = T)
+
+library(tidyverse, quietly = T)
+library(ggthemes, quietly = T)
+library(ggpubr, quietly = T)
+library(patchwork, quietly = T)
+library(viridis, quietly = T)
+
+set.seed(1607)
+```
+
+```{r graphical_params, echo =F}
+.pt2 = .pt*72.27/96 # convert line width in mm to size in points (.pt works for fonts but not for lines)
+pointsize = 1.5
+theme_set(theme_classic(base_size = 10) + 
+            theme(plot.title = element_text(hjust = 0.5),
+                  line = element_line(size = 1/.pt2),
+                  text = element_text(size = 10),
+                  legend.key.size = grid::unit(6, 'pt'),
+                  axis.ticks = element_blank()))
+```
+
+```{r plotting_functions, echo=F}
+coldata_dr <- function(sce, color.column, dimred = 'UMAP', components = c(1,2), alpha=1, size = 1){
+  df <- as.data.frame(reducedDim(sce, dimred)[,components])
+  colnames(df) <- c('dr1','dr2')
+  df[['color.column']] <- colData(sce)[,color.column]
+  
+  ggplot(df, aes(x = dr1, y = dr2)) + geom_point(aes(col = color.column), alpha =alpha, size =size,stroke =0) +
+    labs(x = paste0(dimred,'_',components[1]), y = paste0(dimred,'_',components[2]), colour = color.column)
+}
+
+gene_dr <- function(sce, gene, dimred = 'UMAP', components = c(1,2), assay = 'logcounts', alpha=1, size = 1.5){
+  df <- as.data.frame(reducedDim(sce, dimred)[,components])
+  colnames(df) <- c('dr1','dr2')
+  df[['gene']] <- assay(sce, assay)[gene,]
+  # saturate at .99 quantile 
+  df$gene[df$gene >= quantile(df$gene, .999)] = quantile(df$gene, .999)
+  if(max(df$gene) == 0){return(ggplot(df) + geom_blank())}
+  else{
+    return(ggplot(df, aes(x = dr1, y = dr2)) + geom_point(aes(col = gene), alpha =alpha, size =size,stroke =0) + scale_color_viridis_c() +
+             labs(x = paste0(dimred,'_',components[1]), y = paste0(dimred,'_',components[2]),colour = gene))
+  }
+}
+```
+```{r read_files}
+counts <- read.csv('../data/geo_submission/counts_raw.csv', sep = ',', header = T,row.names = 1)
+coldata <- read.csv('../data/geo_submission/cell_metadata_raw.csv', row.names = 1) 
+
+# identify spike-in genes
+ercc_rows <- grepl('^ERCC', rownames(counts))
+ercc_counts <- counts[ercc_rows,]
+
+# remove spike-in genes from counts
+counts <- counts[!ercc_rows,]
+```
+
+```{r build_sce, warning = FALSE, echo=FALSE, message=FALSE}
+# Build SingleCellExperiment object
+sce <- SingleCellExperiment(assays = list(counts = as.matrix(counts)))
+colnames(sce) <- gsub('.bam','',colnames(sce)) # remove.bam to1 match coldata rownames
+colData(sce)[, colnames(coldata)] <- coldata[colnames(sce),]
+
+# add Gene Symbol
+ens.mm.v97 <- AnnotationHub()[["AH64944"]]
+rowData(sce)$ENSEMBL <- rownames(sce)
+rowData(sce)$SYMBOL <- mapIds(ens.mm.v97, keys=rownames(sce), keytype="GENEID", column="SYMBOL")
+
+# use uniquified Gene Symbols as rownames
+rownames(sce) <- uniquifyFeatureNames(rowData(sce)$ENSEMBL, rowData(sce)$SYMBOL)
+
+# spike_in summarized experiment
+spike_se <- SummarizedExperiment(list(counts=as.matrix(ercc_counts)))
+altExp(sce, "spike_in") <- spike_se
+```
+
+__cell filtering__
+
+Plate _P4rep_ exhibits a large number of poor-quality cells, known to invalidate the outlier-detection approach for cell-filtering. To obviate, QC metrics are shared across plates to select high-quality cells.
+
+```{r cell_filtering, message=F, fig.height = 7, fig.width=7}
+mito <- grep('^mt.*', rowData(sce)[,'SYMBOL'])
+
+stats <- perCellQCMetrics(sce, subsets=list(Mt=mito))
+
+# share QC metrics across good plates
+discard_libsize <- isOutlier(stats$sum, type = 'lower', log = T, 
+                             batch = sce$plate, subset = sce$plate %in% c('2','7'))
+discard_features <- isOutlier(stats$detected, type = 'lower', log = T, 
+                              batch = sce$plate, subset = sce$plate %in% c('2','7'))
+discard_mito <- isOutlier(stats$subsets_Mt_percent, type = 'higher', log = F, 
+                          batch = sce$plate, subset = sce$plate %in% c('2','7'))
+discard_ercc <- isOutlier(stats$altexps_spike_in_percent, type = 'higher', log = F,
+                          batch = sce$plate, subset = sce$plate %in% c('2','7'))
+discard_df <- data.frame(libsize = discard_libsize, features = discard_features, 
+                         mitoc = discard_mito, ercc = discard_ercc, plate = sce$plate)
+
+# discard cells with low library size / few detected genes / high ercc counts
+discard_df$discard <- sign(rowSums(discard_df[,c(1,2,4)]))
+
+colSums(discard_df[,c('libsize','features','mitoc','ercc','discard')])
+colData(sce)[,colnames(stats)] <- stats
+sce$discard <- as.logical(discard_df$discard)
+
+qc_plot <- wrap_plots(
+    plotColData(sce, x="plate", y="sum", colour_by="discard", point_size =.25,
+                show_median =T) +
+      scale_y_log10() + labs(y = 'library size'),
+    plotColData(sce, x="plate", y="detected", colour_by="discard", point_size =.25,
+                show_median =T) + scale_y_log10() + labs(y = 'detected genes'),
+    plotColData(sce, x="plate", y="subsets_Mt_percent", colour_by="discard",
+                point_size =.25, show_median =T) +  labs(y = 'mitochondrial_pct'),
+    plotColData(sce, x="plate", y="altexps_spike_in_percent", colour_by="discard",
+                point_size =.25, show_median =T) + ggtitle("spike_in percent"))
+qc_plot <- qc_plot  + plot_layout(guides = 'collect') & theme_bw(base_size = 7)
+
+print(qc_plot)
+
+# discard low-quality cells
+sce <- sce[,!sce$discard]
+```
+
+__Normalization via deconvolution__
+Pool-based normalization is the recommended normalization method to remove bias associated with RNA content [Lun, A. et al., 2017]. Here, a version optimized for handling batch effects is used:
+
+```{r normalization}
+sce <- computeSumFactors(sce)
+sce <- multiBatchNorm(sce, batch = sce$plate)
+```
+
+__Feature selection__
+The mean-variance relationship is modelled separately for each plate, and significant genes are retained:
+```{r feature_selection, warning=F, message=F}
+# use spike-in to model gene-variance relationship
+genevar <- modelGeneVarWithSpikes(sce, "spike_in", block=sce$plate)
+chosen.hvgs <- getTopHVGs(genevar, fdr.threshold = 0.05)
+# remove cell-cycle genes 
+cc.genes <- AnnotationDbi::select(org.Mm.eg.db, keys="GO:0007049", keytype="GOALL", column="ENSEMBL")$ENSEMBL
+chosen.hvgs <- chosen.hvgs[!rowData(sce)[chosen.hvgs, 'ENSEMBL'] %in% cc.genes]
+```
+
+```{r, warning=F, fig.width=6}
+genevar_plots = lapply(1:length(unique(sce$plate)), function(i){
+  genevar_genes =  genevar$per.block[[i]] %>% as.data.frame()
+  genevar_spikeins = data.frame(mean = metadata(genevar$per.block[[i]])$mean, 
+                                var = metadata(genevar$per.block[[i]])$var)
+  genevar_genes$trend = metadata(genevar$per.block[[i]])$trend(genevar_genes$mean)
+  ggplot(genevar_genes, aes(x = mean, y = total)) + geom_point(size = 0.25*pointsize, col = 'grey60') +
+    geom_point(inherit.aes = F, data = genevar_spikeins, aes(x = mean, y = var),size = pointsize, col = 'red') +
+    geom_line(inherit.aes = F, data = genevar_genes, aes(x = mean, y = trend), col = 'blue') +
+    theme_bw() + labs(title = unique(sce$plate)[i]) + xlim(c(0,12)) + ylim(c(0,17.5))
+})
+
+wrap_plots(genevar_plots)
+```
+
+__batch correction__
+Plate-effects can be corrected by using a linear method from the ```limma``` package:
+```{r linear_batch_correction}
+assay(sce, "corrected") <- removeBatchEffect(logcounts(sce), batch = sce$plate)
+```
+
+# Analysis
+## dimensionality reduction
+```{r pca}
+sce <- runPCA(sce, exprs_values = "corrected", subset_row = chosen.hvgs)
+pc_var = data.frame(var_pct = attr(reducedDim(sce),'percentVar'))
+ggplot(data.frame(var_pct = attr(reducedDim(sce),'percentVar')), aes(x = order(var_pct, decreasing = T), y = var_pct)) + 
+  geom_point()+ geom_line() + theme_bw() + geom_vline(xintercept = 10, col = 'red')
+```
+Analysis of explained variance per PC shows that most information is contained in the first few components. We will retain 10 for downstream analyses.
+
+*PHATE* has been popularized as an effective dimensionality reduction method to visualize differentiation trajectories: 
+```{r phate}
+reducedDim(sce, 'PHATE2D') <-  phateR::phate(reducedDim(sce,'PCA')[,1:10], ndim =2, verbose =0)$embedding
+coldata_dr(sce,color.column = 'cell_type2', dimred = 'PHATE2D',size = pointsize)  +
+  scale_color_tableau(palette = 'Tableau 10') + labs( title = 'cell type')
+```
+This visualization broadly confirms  proximity relationships across hematopoietic compartments.
+
+## diffusion pseudotime and lineage scores
+Additional annotation is generated by:
+
+* Computing pseudotime coordinates using diffusion pseudotime via the ```destiny``` package.
+
+* Running Seurat's ```AddModuleScore``` function to aggregate the expression of known lineage markers and score their expression on each cell: 
+
+```{r annotation}
+# compute diffusion map (necessary for diffusion pseudotime)
+dmap = destiny::DiffusionMap(reducedDim(sce,'PCA')[,1:10])
+reducedDim(sce, 'DiffusionMap') <-  dmap@eigenvectors
+
+# isolate stem cell tip on PHATE coordinates
+stem_tip = as.integer(which.min(as.logical(sce$cell_type2 == 'HSC') * reducedDim(sce,'PHATE2D')[,1]))
+sce$stem_tip = FALSE
+sce$stem_tip[stem_tip] = TRUE
+
+dpt =destiny::DPT(dmap, tips = stem_tip)
+
+# assign pseudotime coordinate
+sce$dpt = dpt$DPT489 # this is the value of stem_tip
+sce$dpt_rank = rank(sce$dpt)
+
+lineage_sets <- openxlsx::read.xlsx('../docs/camargo_sets.xlsx')
+
+# load SingleCellExperiment object in Seurat
+seu <- CreateSeuratObject(counts = counts(sce))
+seu@assays$RNA@data = assay(sce, 'corrected')
+selection = c('preMeg','preEry','preGM','preB')
+
+# compute scores for selected sets
+for(i in selection){
+  feature_names = rownames(seu)[rowData(sce)[, 'SYMBOL'] %in% lineage_sets[[i]]]
+  seu <- AddModuleScore(seu, features = list(feature_names), name = i)}
+
+# transfer scores in SingleCellExperiment object
+colData(sce)[,selection] <- seu@meta.data[,paste0(selection,'1')]
+
+# plotting
+p_dpt <- coldata_dr(sce, color.column = 'dpt_rank', dimred = 'PHATE2D',size = pointsize) +
+  scale_color_viridis_c() + guides(col = F) + labs( title ='pseudotie rank')
+p_my <- coldata_dr(sce, color.column = 'preGM', dimred = 'PHATE2D',size = pointsize) + 
+  scale_color_viridis_c()  + guides(col = F) + labs( title ='myeloid score')
+p_mk <- coldata_dr(sce, color.column = 'preMeg', dimred = 'PHATE2D',size = pointsize) +
+  scale_color_viridis_c()  + guides(col = F) + labs( title ='mk score')
+p_ery <- coldata_dr(sce, color.column = 'preEry', dimred = 'PHATE2D',size = pointsize) +
+  scale_color_viridis_c()  + guides(col = F) + labs( title ='ery score')
+
+fig <- (p_dpt +   p_mk + p_my + p_ery) + plot_layout(guides = 'collect') & 
+  theme(axis.title = element_blank(),
+        axis.text = element_blank())
+
+fig
+```
+
+Next, we'll investigate proximity relations between HSCs and MkP subsets. 
+
+## proximity analysis {.tabset .tabset-pills}
+
+
+### MkP_CD48 vs Sca1
+
+Distance between CD48 subsets of MkP and HSCs:
+
+```{r distance}
+mkp_cols <- sce$cell_type2 == 'MkP'
+hsc_cols <- sce$cell_type2 == 'HSC' 
+distance <- as.matrix(dist(reducedDim(sce)[,1:10]))
+distance <- distance[mkp_cols, hsc_cols] %>% rowMedians()
+
+df <- data.frame(subset = sce$CD48_binary[mkp_cols], distance = distance)
+
+distance_boxplot_MkP <- ggboxplot(data = df, x = 'subset', y = 'distance', add = 'jitter', color = 'subset', palette = viridis(2)) + 
+  stat_compare_means(comparisons = list(c('low','high')), 
+                     method = 'wilcox.test',label = "p.signif") + xlab('MkP CD 48 subset') + ylab('proximity to HSC') + scale_y_reverse() + 
+  guides(col =F)
+
+distance_boxplot_MkP
+```
+
+### HSC_Sca1 subsets vs MkP_48low
+
+Distance between Sca-1 subsets of HSCs and CD48-/lo MkPs:
+
+```{r distance2}
+mkp_cols <- sce$cell_type2 == 'MkP' & sce$CD48_binary == 'low'
+hsc_cols <- sce$cell_type2 == 'HSC' 
+distance <- as.matrix(dist(reducedDim(sce)[,1:10]))
+distance <- distance[mkp_cols, hsc_cols] %>% colMedians()
+
+df <- data.frame(subset = sce$Sca_1_binary[hsc_cols], distance = distance, Sca1 = sce$Sca_1_log10[hsc_cols], 
+                 CD201 = sce$CD201_log10_normalized[hsc_cols])
+
+distance_boxplot_HSC <- ggboxplot(data = df, x = 'subset', y = 'distance', add = 'jitter', color = 'subset', palette = viridis(2)) + 
+  stat_compare_means(comparisons = list(c('low','high')), 
+                     method = 'wilcox.test',label = "p.signif") + xlab('HSC Sca1 subset') + ylab('proximity to MkP (CD 48 low)') + scale_y_reverse() + 
+  guides(col =F)
+
+distance_boxplot_HSC
+```
+
+##
+
+__refine populations__
+
+Based on expression of surface markers, we refine the populations. Subsets that we're interested in are higlighted in the following plot:
+
+*Note: Very few cells are observed as Sca1- and CD201+. Here, CD201+ HSCs are grouped for simplicity.*
+
+```{r CD201_Sca1_subpopulations}
+sce$cell_type3<- as.character(sce$cell_type2)
+
+sce$cell_type3[sce$cell_type2 == 'MkP' & sce$CD48_binary == 'low'] = 'MkP_CD48-'
+sce$cell_type3[sce$cell_type2 == 'MkP' & sce$CD48_binary == 'high'] = 'MkP_CD48+'
+
+sce$cell_type3[sce$cell_type2 == 'HSC' & sce$Sca_1_binary == 'low'] = 'HSC_Sca1-'
+sce$cell_type3[sce$cell_type2 == 'HSC' & sce$Sca_1_binary == 'high'] = 'HSC_Sca1+'
+
+sce$cell_type3[sce$cell_type2 == 'MPP' & sce$Sca_1_binary == 'low'] = 'MPP_Sca1-'
+sce$cell_type3[sce$cell_type2 == 'MPP' & sce$Sca_1_binary == 'high'] = 'MPP_Sca1+'
+
+sce$cell_type3[sce$cell_type2 == 'HPC_1' & sce$Sca_1_binary == 'low'] = 'HPC1_Sca1-'
+sce$cell_type3[sce$cell_type2 == 'HPC_1' & sce$Sca_1_binary == 'high'] = 'HPC1_Sca1+'
+
+sce$cell_type3[sce$cell_type3 == 'HSC_Sca1+' & sce$CD201_binary == 'high'] = 'HSC_Sca1+__CD201+'
+sce$cell_type3[sce$cell_type3 == 'HSC_Sca1+' & sce$CD201_binary == 'low'] = 'HSC_Sca1+__CD201-'
+
+sce$cell_type3[sce$cell_type3 == 'HSC_Sca1-' & sce$CD201_binary == 'high'] = 'HSC_Sca1-__CD201+'
+sce$cell_type3[sce$cell_type3 == 'HSC_Sca1-' & sce$CD201_binary == 'low'] = 'HSC_Sca1-__CD201-'
+
+# transcript-based
+sce$cell_type3[sce$cell_type2 == 'HPC_1' & sce$preB >2] = 'HPC1_lymphoid'
+```
+
+```{r CD201_group}
+sce$cell_type4<- as.character(sce$cell_type3)
+
+sce$cell_type4[sce$cell_type3 == 'HSC_Sca1-__CD201+'] = 'HSC_CD201+'
+sce$cell_type4[sce$cell_type3 == 'HSC_Sca1+__CD201+'] = 'HSC_CD201+'
+```
+```{r}
+p <- coldata_dr(sce, col = 'cell_type4',dimred = 'PHATE2D', size = pointsize) +
+  scale_color_manual(values = c(rep('lightgrey',3),"#4E79A7","#F28E2B","#E15759", rep('lightgrey',2),"#00AFBB", "#E7B800",rep('lightgrey',2)))  + labs(title = 'hsc subsets')
+
+p
+```
+
+## PAGA analysis
+
+Proximity analysis for n>2 populations is unwieldy. We will use PAGA to investigate proximity relations systematically:
+```{r PAGA_export}
+### assign gene expression values in easily accessible containers:
+pca <- reducedDim(sce,'PCA')
+logc <- assay(sce,'corrected')
+coldata <- as.data.frame(colData(sce))
+rowdata <- as.data.frame(rowData(sce))
+```
+
+```{python PAGA, message=F, warning=F}
+import scanpy as sc
+import numpy as np
+x = sc.AnnData(X = r.logc.transpose())
+x.obsm['X_pca'] = np.array(r.pca)
+x.obs = r.coldata
+x.var_names = r.rowdata.index
+
+sc.pp.neighbors(x, n_pcs =10)
+sc.tl.paga(x, groups='cell_type4')
+sc.pl.paga(x, color=['cell_type4'], threshold =.9, layout = 'fr', edge_width_scale =0.25)
+```
+
+The PAGA layout largely confirms the results from the labelling propagation data. To verify that this network is the "best fitting one", i.e., no alternative models can explain the as well as the one displayed, we can plot the distribution of the confidence placed by the model in each link, and highlight the links that exceed the selected threshold:
+
+```{python}
+connectivies = x.uns['paga']['connectivities']
+```
+```{r, fig.width=3.5, fig.height=3}
+connectivities = as.matrix(py$connectivies)
+connectivities = unlist(connectivities[upper.tri(connectivities)])
+df = data.frame(confidence = connectivities)
+
+fig_sx2 = ggplot(df, aes(x = confidence)) + geom_histogram(aes(fill = confidence > 0.9),bins = 20) + 
+  scale_fill_tableau() + theme(text = element_text(size =10))
+fig_sx2
+```
+
+## Pseudotime vs Mk score
+
+PAGA connectivities seem to  infer a differentiaion link from CD48- MkP to CD48+ MkP. By looking more closely at the relationship between pseudotime and Mk score, we observe how differentiation (of which Mk score represents a transcriptional proxy) proceeds indipendently in the two subsets:
+```{r}
+# use default dpt
+df = colData(sce)[,c('cell_type3','cell_type4','preMeg','dpt', 'CD48_log10')] %>%
+  as.data.frame() %>%
+  dplyr::filter(grepl('^MkP', cell_type3), preMeg > 0)
+
+p2 <- ggscatter(df%>% dplyr::filter(grepl('^MkP', cell_type3)), x = 'dpt', y = 'preMeg', color = "cell_type3",
+                size =pointsize,
+                add = "reg.line",  # Add regressin line
+                #add.params = list(color = 'cell_type3'),
+                palette =c("#00AFBB", "#E7B800"),
+                add.params = list(color = "cell_type3", fill = "lightgray"), # Customize reg. line
+                conf.int = TRUE, # Add confidence interval
+                cor.coeff.args = list(label.sep = "\n")) + labs(y = 'mk score', x = 'pseudotime') + 
+  stat_cor(aes(color = cell_type3), size =10/.pt) + guides(col='none')
+
+fig_sx3 = p2 + plot_annotation(caption = 'two cells from myeloid branch with low mk score were excluded') 
+fig_sx3
+```
+
+## Other plots:
+
+### Sca-1, CD48 surface expression
+```{r}
+df <- as.data.frame(reducedDim(sce, 'PHATE2D')[,c(1,2)])
+colnames(df) <- c('dr1','dr2')
+df[['CD48_log10']] <- colData(sce)[,'CD48_log10']
+df[['Sca1_log10']] <- colData(sce)[,'Sca_1_log10']
+
+p_Sca1 <- ggplot(df, aes(x = dr1, y = dr2)) + geom_point(col = 'grey90', alpha =.8, size =pointsize,stroke =0) + 
+  geom_point(data= df[sce$cell_type2 %in% c('HSC','MPP','HPC_1'),] , aes(x = dr1,y=dr2, col = Sca1_log10), size =pointsize, stroke=0,inherit.aes = F)  + scale_color_viridis_c() + guides(col =F) + labs( title ='Sca1')
+
+p_mkpsubs <- coldata_dr(sce, col = 'cell_type3',dimred = 'PHATE2D', size = pointsize) +
+  scale_color_manual(values = c(rep('lightgrey',9),"#4E79A7","#F28E2B", rep('lightgrey',2)))  + labs(title = 'mkp subsets')
+
+fig_3ef <- (p_Sca1 / p_mkpsubs) & 
+  theme(legend.position = 'none',
+        axis.title = element_blank(),
+        axis.text = element_blank())
+fig_3ef
+```
+
+
+### proximity analysis in PHATE space {.tabset .tabset-pills}
+#### MkP_CD48 vs Sca1
+```{r}
+mkp_cols <- sce$cell_type2 == 'MkP'
+hsc_cols <- sce$cell_type2 == 'HSC' 
+distance <- as.matrix(dist(reducedDim(sce,'PHATE2D')))
+distance <- distance[mkp_cols, hsc_cols] %>% rowMedians()
+
+df <- data.frame(subset = sce$CD48_binary[mkp_cols], distance = distance, 
+                 Sca1 = sce$Sca_1_log10[mkp_cols], 
+                 CD201 = sce$CD201_log10_normalized[mkp_cols])
+
+distance_boxplot_MkP <- ggboxplot(data = df, x = 'subset', y = 'distance', add = 'jitter', 
+                                  color = 'subset', add.params = list(size = pointsize), palette = viridis(2)) + 
+  stat_compare_means(comparisons = list(c('low','high')), 
+                     method = 'wilcox.test',label = "p.signif") + xlab('MkP CD48 subset') + ylab('proximity to HSC') + scale_y_reverse() + guides(col =F)
+distance_boxplot_MkP
+```
+
+#### HSC_Sca1 subsets vs MkP_48low
+
+```{r}
+mkp_cols <- sce$cell_type2 == 'MkP' & sce$CD48_binary == 'low'
+hsc_cols <- sce$cell_type2 == 'HSC' 
+distance <- as.matrix(dist(reducedDim(sce,'PHATE2D')))
+distance <- distance[mkp_cols, hsc_cols] %>% colMedians()
+
+df <- data.frame(subset = sce$Sca_1_binary[hsc_cols], distance = distance, Sca1 = sce$Sca_1_log10[hsc_cols], 
+                 CD201 = sce$CD201_log10_normalized[hsc_cols])
+
+distance_boxplot_HSC <- ggboxplot(data = df, x = 'subset', y = 'distance', add = 'jitter', 
+                                  color = 'subset', add.params = list(size = pointsize), palette = viridis(2)) + 
+  stat_compare_means(comparisons = list(c('low','high')), 
+                     method = 'wilcox.test',label = "p.signif") + xlab('HSC Sca1 subset') + ylab('proximity to MkP (CD 48 low)') + scale_y_reverse() + guides(col =F)
+
+
+fig_sx1 <- (distance_boxplot_MkP / distance_boxplot_HSC) & theme(text = element_text(size =7), axis.text.y = element_blank())
+
+fig_sx1
+```
+
+
+
+### Vwf and CD41 expression across cell_types ###
+```{r, fig.height = 6, fig.width=8}
+my_theme <- theme(axis.text = element_blank(),
+                  axis.title = element_blank()) 
+p_vwf <- gene_dr(sce, gene = 'Vwf', dimred = 'PHATE2D', size = pointsize) + guides(col =F) + my_theme
+p_cd41 <- gene_dr(sce, gene = 'Itga2b', dimred = 'PHATE2D', size = pointsize) + guides(col =F) + my_theme
+
+# boxplots -------------------------------------------------------
+
+cell_types = c('HSC_CD201+', 'HSC_Sca1+__CD201-', 'HSC_Sca1-__CD201-',  'MkP_CD48-', 'MkP_CD48+','HPC1_Sca1+')
+
+assayname <- 'logcounts'
+
+df <- colData(sce)[sce$cell_type4 %in% cell_types,] %>% as.data.frame() %>%
+  dplyr::select(cell_type4, plate,CD41_log10 )
+df$Vwf <- assay(sce, assayname)['Vwf', sce$cell_type4 %in% cell_types]
+df$Cd41 <- assay(sce, assayname)['Itga2b', sce$cell_type4 %in% cell_types]
+df$cell_type4 <- factor(df$cell_type4, 
+                        levels = c('HSC_CD201+', 'HSC_Sca1+__CD201-', 'HSC_Sca1-__CD201-',  'MkP_CD48-', 'MkP_CD48+','HPC1_Sca1+'))
+
+comparisons <-  list(c('HSC_CD201+', 'HSC_Sca1+__CD201-'),
+                     c('HSC_CD201+', 'HSC_Sca1-__CD201-'),
+                     c('HSC_CD201+', 'MkP_CD48-'),
+                     c('HSC_CD201+', 'MkP_CD48+'),
+                     c('HSC_Sca1+__CD201-', 'HSC_Sca1-__CD201-'),
+                     c('HSC_Sca1+__CD201-', 'MkP_CD48-'),
+                     c('HSC_Sca1+__CD201-', 'MkP_CD48+'),
+                     c('HSC_Sca1-__CD201-', 'MkP_CD48-'),
+                     c('HSC_Sca1-__CD201-', 'MkP_CD48+'),
+                     c('MkP_CD48-', 'MkP_CD48+'))
+
+
+
+p_vwf.2 <- ggplot(df, aes(x = cell_type4, y = Vwf)) + geom_boxplot(outlier.colour = NA) + 
+   geom_jitter(stroke =0 , alpha =0.5, size = pointsize) + stat_compare_means(comparisons = comparisons, label = 'p.signif', size =7/.pt) +
+  theme(axis.text.x = element_text(angle = -30, hjust =0, vjust = 0.5)) + theme(axis.text.x = element_blank())
+
+p_cd41.2 <- ggplot(df, aes(x = cell_type4, y = Cd41)) + geom_boxplot(outlier.colour = NA) + 
+   geom_jitter(stroke =0 , alpha =0.5, size = pointsize) + stat_compare_means(comparisons = comparisons, label = 'p.signif', size =7/.pt) +
+  theme(axis.text.x = element_text(angle = -30, hjust =0, vjust = 0.5))
+
+fig_s7e <- (p_vwf + p_vwf.2 + p_cd41 + p_cd41.2) + 
+  plot_layout(ncol =2, widths = c(0.4,0.8)) & theme(text = element_text(size =7))
+fig_s7e
+```
+
+## sessionInfo - R and Python
+```{r}
+sessionInfo()
+```
+```{python}
+import session_info
+session_info.show()
+```
+

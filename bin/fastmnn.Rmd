@@ -1,0 +1,93 @@
+---
+title: "MNN batch correction"
+output:
+  html_document:
+    df_print: paged
+    code_folding: hide
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    theme: flatly
+    highlight: zenburn
+  pdf_document: default
+editor_options:
+  chunk_output_type: inline
+---
+Here, I try using ```fastMNN``` batch correction and reproduce main results from the scRNA-seq analysis
+
+# Load data
+```{r, echo=F}
+knitr::opts_chunk$set(echo = TRUE, warning=F, message=F,
+                      fig.width = 5.5, fig.height = 4.5, fig.align = 'center',
+                      cache=F)
+```
+```{r}
+#reticulate::use_condaenv("base")
+library(reticulate, quietly = T)
+use_python('/Users/greco/opt/anaconda3/bin/python',required = T)
+
+library(batchelor, quietly=T)
+library(scater, quietly=T)
+library(phateR, quietly=T)
+
+library(tidyverse, quietly=T)
+
+set.seed(1607)
+
+.pt2 = .pt*72.27/96 # convert line width in mm to size in points (.pt works for fonts but not for lines)
+pointsize = 1.5
+
+theme_set(theme_classic(base_size = 7) + 
+            theme(plot.title = element_text(hjust = 0.5),
+                  line = element_line(size = 1/.pt2),
+                  text = element_text(size = 7),
+                  legend.key.size = grid::unit(3, 'pt'),
+                  axis.ticks = element_blank()))
+
+```
+
+```{r}
+load('../data/workspace.rda')
+```
+# MNN
+```{r}
+# compute mnn
+mnn <- fastMNN(sce, batch = sce$plate, assay.type = 'logcounts', subset.row = chosen.hvgs)
+#add to SingleCellExperiment
+reducedDim(sce, 'mnn') = reducedDim(mnn, 'corrected')
+# compute PHATE
+```
+
+## dimensionality reduction
+```{r}
+reducedDim(sce, 'PHATE2D_MNN') <-  phateR::phate(reducedDim(sce,'mnn')[,1:10], ndim =2)$embedding
+# visualize cell type
+p_celltype <- coldata_dr(sce, color.column = 'cell_type2', dimred = 'PHATE2D_MNN', size = pointsize) +  scale_color_tableau() +
+  theme(axis.text = element_blank(), axis.ticks = element_blank(),axis.title = element_blank()) + guides(col = 'none')
+
+p_celltype
+#ggsave('./figures/phate_mnn.pdf', p_celltype, width = 3.25, height = 3, units = 'cm')
+```
+
+## PAGA
+
+```{r PAGA_export}
+pca <- reducedDim(sce,'mnn')
+logc <- assay(sce,'logcounts')
+coldata <- as.data.frame(colData(sce))
+rowdata <- as.data.frame(rowData(sce))
+```
+
+```{python PAGA}
+import scanpy as sc
+import numpy as np
+x = sc.AnnData(X = r.logc.transpose())
+x.obsm['X_pca'] = np.array(r.pca)
+x.obs = r.coldata
+x.var_names = r.rowdata.index
+
+sc.pp.neighbors(x,  n_pcs =10)
+sc.tl.paga(x, groups='cell_type4')
+sc.pl.paga(x, color=['cell_type4'], threshold =.9, layout = 'fr', edge_width_scale =0.25 )
+```
+

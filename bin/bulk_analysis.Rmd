@@ -1,0 +1,237 @@
+---
+title: "Bulk analysis"
+output:
+  html_document:
+    df_print: paged
+    code_folding: hide
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    theme: flatly
+    highlight: zenburn
+  pdf_document: default
+editor_options:
+  chunk_output_type: inline
+---
+
+Analysis of bulk RNA-seq data from MkP CD48 subsets. (DE analysis performed using ```DESeq2```)
+
+```{r, echo=F}
+knitr::opts_chunk$set(echo = TRUE, warning=F, message=F,
+                      fig.width = 7, fig.height = 7, fig.align = 'center',
+                      fig.show='hold', cache=F)
+```
+
+```{r includes, message=F, warning=F}
+library(openxlsx, quietly = T)
+library(tidyverse, quietly = T)
+library(scales, quietly = T)
+library(ggthemes, quietly = T)
+library(patchwork, quietly = T)
+
+library(scater, quietly = T)
+library(org.Mm.eg.db, quietly = T)
+library(msigdbr, quietly = T)
+
+library(clusterProfiler, quietly = T)
+library(enrichplot, quietly = T)
+library(ggrepel, quietly = T)
+library(ggrastr, quietly = T)
+
+filter = dplyr::filter
+
+.pt2 = .pt*72.27/96 # convert line width in mm to size in points (.pt works for fonts but not for lines)
+pointsize = .5
+theme_set(theme_classic(base_size = 10) + 
+            theme(plot.title = element_text(hjust = 0.5),
+                  line = element_line(size = 1/.pt2),
+                  text = element_text(size = 10),
+                  legend.key.size = grid::unit(6, 'pt'),
+                  axis.ticks = element_blank()))
+```
+# read files
+```{r read_deg}
+d_exp <- read.xlsx('../data/bulk_MkP_cd48/bfx1622.deseq-results.separate.xlsx', sheet = 2)
+d_exp$Entrez_ID <- mapIds(org.Mm.eg.db, keys = d_exp$Ensembl_ID, column="ENTREZID", keytype="ENSEMBL")
+```
+
+# volcano
+```{r}
+sce = readRDS('../data/sce.rds') # read SingleCellExperiment
+
+df = data.frame(
+  CD48_plus = rowSums(sign(counts(sce)[,sce$cell_type3 == 'MkP_CD48+']))/
+  sum(sce$cell_type3 == 'MkP_CD48+'),
+  CD48_minus = rowSums(sign(counts(sce)[, sce$cell_type3 == 'MkP_CD48-']))/
+  sum(sce$cell_type3 == 'MkP_CD48-'))
+
+df$Ensembl_ID = rowData(sce)[,'ENSEMBL']
+
+mk_markers <- c('Pf4','Itga2b','Cd9','Rap1b', 'F2r','Plek',
+                'Gata1','Mef2c', 'Vwf','Gata2', 'Cd48')
+
+scale_forw2 <- function(x){pmin(x,10+(x-10)/5)}
+scale_inv2 <- function(x){pmax(x,5*(x-10)+10)}
+custom_t2 <- trans_new('custom_scale2', 
+                      transform = 'scale_forw2', 
+                      inverse = 'scale_inv2')
+
+pval_thresh = 1e-02
+logFC_thresh = 1
+
+# insert variation here
+d_exp <- left_join(d_exp, df)
+d_exp$expressing <- d_exp$CD48_plus
+d_exp$expressing[d_exp$log2FoldChange <0] <- d_exp$CD48_minus[d_exp$log2FoldChange <0]
+d_exp$expressing[is.na(d_exp$expressing)] = 0
+d_exp$expressing <- cut(d_exp$expressing, 
+                        breaks = c(0,0.1,0.25,0.5,0.75, 0.9,1),
+                        include.lowest = T,right = F)
+
+d_exp$code <- 0
+d_exp$code[abs(d_exp$log2FoldChange) > logFC_thresh] <- 1
+d_exp$code[d_exp$padj < pval_thresh] <- 2
+d_exp$code[d_exp$padj < pval_thresh & abs(d_exp$log2FoldChange) > logFC_thresh] <- 3
+d_exp$code <- factor(d_exp$code)
+
+
+mk_volcano <- ggplot(d_exp, aes(x = -log2FoldChange, y = -log10(padj))) + 
+  geom_point(data = d_exp %>% filter(padj < pval_thresh | abs(log2FoldChange) > logFC_thresh),
+             aes(col = code, shape = expressing), size = 1.5, alpha = .75) + 
+  # subsample non-significant genes to reduce plot size
+  geom_point_rast(data = d_exp %>% filter(padj > pval_thresh & abs(log2FoldChange) < logFC_thresh) %>% 
+                    slice_sample(prop = 0.25), 
+                  aes(col = code, shape = expressing), size = 0.5, alpha = .5, color = 'grey90') + 
+  #scale_shape_discrete(solid=T) +
+  scale_shape_manual(values = c(3,1,2,0,0,0)) +
+  scale_y_continuous(trans =custom_t2, breaks = c(0,5,10,20,30,40)) +
+  geom_hline(yintercept = -log10(pval_thresh)) + 
+  geom_vline(xintercept = -logFC_thresh) + 
+  geom_vline(xintercept = logFC_thresh) +
+  scale_color_manual(values = c('cadetblue','darkorange','red')) + 
+  geom_label_repel(data = d_exp %>% 
+                     dplyr::filter(Gene_Symbol %in% mk_markers), 
+                   max.overlaps = 50,alpha = 1, col = 'grey30', size = 8/.pt,force = 3, force_pull = 0.5,
+                   aes(x = -log2FoldChange, y = -log10(padj), 
+                       label = Gene_Symbol)) +
+
+  geom_text_repel(data = d_exp %>% dplyr::filter(padj<1e-10), 
+                  max.overlaps = 50,alpha = 1, col = 'red', 
+                  size =7/.pt,
+                  aes(x = -log2FoldChange, y = -log10(padj), label = Gene_Symbol)) +
+  
+  geom_point(data = d_exp %>% dplyr::filter(Gene_Symbol %in% mk_markers),col = 'black')  + guides(col = 'none')
+
+print(mk_volcano)
+
+# save
+# ggsave('./figures/de_mk.markers.pdf',mk_volcano, width = 3.5, height =3)
+```
+
+# preprocess gene lists
+```{r input_lists}
+ranked_d_exp <- d_exp %>% arrange(desc(log2FoldChange)) %>% 
+  dplyr::select(Gene_Symbol, Ensembl_ID, Entrez_ID, log2FoldChange)
+
+ranked_ens <- ranked_d_exp$log2FoldChange
+names(ranked_ens) <- ranked_d_exp$Ensembl_ID
+
+ranked_entrez <- ranked_d_exp$log2FoldChange
+names(ranked_entrez) <- ranked_d_exp$Entrez_ID
+
+
+deg <- d_exp %>% filter(padj <0.01)
+deg_up <- d_exp %>% filter(log2FoldChange > 0, padj <0.01)
+deg_dn <- d_exp %>% filter(log2FoldChange < 0, padj <0.01)
+```
+
+# MsigDB - celltype GSEA
+
+```{r}
+msigdb_celltype <- msigdbr(species = 'Mus musculus', category = 'C8')
+
+ery <- msigdb_celltype %>% filter(grepl('ERYTHR', gs_name)) #%>% group_by(gs_name) %>% summarise(n=n())
+
+mk <- msigdb_celltype %>% filter(grepl('MEGAK', gs_name)) #%>% group_by(gs_name) %>% summarise(n=n())
+
+ly <- msigdb_celltype %>% filter(grepl('LYMPHO', gs_name)) #%>% group_by(gs_name) %>% summarise(n=n())
+
+my <- msigdb_celltype %>% filter(grepl('MYELOID|MICROGLIA|KUPFER', gs_name))# %>% group_by(gs_name) %>% summarise(n=n())
+
+msigdb_celltype_restricted <- rbind(ery, mk, ly, my)
+```
+
+```{r celltype}
+celltype_gsea <- GSEA(geneList = ranked_ens[!is.na(ranked_ens)], 
+                TERM2GENE = msigdb_celltype_restricted[,c('gs_name','ensembl_gene')],
+                pvalueCutoff = 1)%>% 
+  setReadable(OrgDb = org.Mm.eg.db, keyType = 'ENSEMBL')
+
+celltype_up <- enricher(gene =deg_up$Ensembl_ID, 
+                       TERM2GENE = msigdb_celltype_restricted[,c('gs_name','ensembl_gene')]) %>%
+  setReadable(OrgDb = org.Mm.eg.db, keyType = 'ENSEMBL')
+
+celltype_dn <- enricher(gene =deg_dn$Ensembl_ID, 
+                       TERM2GENE = msigdb_celltype_restricted[,c('gs_name','ensembl_gene')]) %>%
+  setReadable(OrgDb = org.Mm.eg.db, keyType = 'ENSEMBL')
+```
+
+## Hematopoietic lineages plots
+```{r plots}
+ery_gsea <- celltype_gsea %>% filter(grepl('ERYTHR', ID))
+ery_colors <- ifelse(ery_gsea@result$p.adjust < 0.01, 'red3', 'grey60')
+names(ery_colors) <- ery_gsea@result$Description
+ery_plot <- gseaplot2(ery_gsea, geneSetID = 1:ncol(ery_gsea@result), 
+                      subplots = 1) + 
+  geom_hline(yintercept = 0) + ylim(c(-0.6,0.6)) + guides(col = 'none') + 
+  scale_color_manual(values = ery_colors) + 
+  labs(title = 'erythroid_celltypes')
+
+
+mk_gsea <- celltype_gsea %>% filter(grepl('MEGAKARY', ID))
+mk_colors <- ifelse(mk_gsea@result$p.adjust < 0.01, 'red3', 'grey60')
+names(mk_colors) <- mk_gsea@result$Description
+mk_plot <- gseaplot2(mk_gsea, geneSetID = 1:ncol(mk_gsea@result), 
+                      subplots = 1) + 
+  geom_hline(yintercept = 0) + ylim(c(-0.6,0.6)) + guides(col = 'none') + 
+  scale_color_manual(values = mk_colors) + 
+  labs(title = 'megakaryocytic_celltypes')
+
+
+ly_gsea <- celltype_gsea %>% filter(grepl('LYMPHO', ID))
+ly_colors <- ifelse(ly_gsea@result$p.adjust < 0.01, 'turquoise4', 'grey60')
+names(ly_colors) <- ly_gsea@result$Description
+ly_plot <- gseaplot2(ly_gsea, geneSetID = 1:ncol(ly_gsea@result), 
+                      subplots = 1) + 
+  geom_hline(yintercept = 0) + ylim(c(-0.6,0.6)) + guides(col = 'none') + 
+  scale_color_manual(values = ly_colors) + labs(title = 'lymphoid_celltypes')
+
+
+my_gsea <- celltype_gsea %>% filter(grepl('MYELOID|MICROGLIA|KUPFER', ID))
+my_colors <- ifelse(my_gsea@result$p.adjust < 0.01, 'limegreen', 'grey60')
+names(my_colors) <- my_gsea@result$Description
+my_plot <- gseaplot2(my_gsea, geneSetID = 1:ncol(my_gsea@result), 
+                      subplots = 1) + 
+  geom_hline(yintercept = 0) + ylim(c(-0.6,0.6)) + guides(col = 'none') + 
+  scale_color_manual(values = my_colors) + labs(title = 'myeloid_celltypes')
+
+
+# ggsave('./figures/hem_celltypes_msigdb.pdf',plot = celltype_plot, width =6, height = 6)
+
+celltype_plot <- (ery_plot + my_plot + mk_plot + ly_plot) + 
+  plot_layout(nrow = 2)
+print(celltype_plot)
+
+```
+
+# write results
+```{r, eval=F}
+write.xlsx(x = list('Over-representation_48hi' = celltype_up@result %>% filter(p.adjust<0.01),
+                    'Over-representation_48lo' = celltype_dn@result %>% filter(p.adjust<0.01),
+                    'GSEA_48hi' = celltype_gsea@result %>% filter(NES >0),
+                    'GSEA_48lo' = celltype_gsea@result %>% filter(NES <0)),
+           file = './figures/tables/enrichment_celltype.xlsx', 
+           asTable = T)
+```
+
+
