@@ -77,6 +77,9 @@ gene_dr <- function(sce, gene, dimred = 'UMAP', components = c(1,2), assay = 'lo
   }
 }
 ```
+
+The counts tables are deposited on the [Gene Expression Omnibus database (GEO)](https://www.ncbi.nlm.nih.gov/geo/), accession number GSE159390. 
+
 ```{r read_files}
 counts <- read.csv('../data/geo_submission/counts_raw.csv', sep = ',', header = T,row.names = 1)
 coldata <- read.csv('../data/geo_submission/cell_metadata_raw.csv', row.names = 1) 
@@ -436,7 +439,7 @@ p_Sca1 <- ggplot(df, aes(x = dr1, y = dr2)) + geom_point(col = 'grey90', alpha =
 p_mkpsubs <- coldata_dr(sce, col = 'cell_type3',dimred = 'PHATE2D', size = pointsize) +
   scale_color_manual(values = c(rep('lightgrey',9),"#4E79A7","#F28E2B", rep('lightgrey',2)))  + labs(title = 'mkp subsets')
 
-fig_3ef <- (p_Sca1 / p_mkpsubs) & 
+fig_3ef <- (p_Sca1 + p_mkpsubs) & 
   theme(legend.position = 'none',
         axis.title = element_blank(),
         axis.text = element_blank())
@@ -445,6 +448,7 @@ fig_3ef
 
 
 ### proximity analysis in PHATE space {.tabset .tabset-pills}
+
 #### MkP_CD48 vs Sca1
 ```{r}
 mkp_cols <- sce$cell_type2 == 'MkP'
@@ -479,12 +483,10 @@ distance_boxplot_HSC <- ggboxplot(data = df, x = 'subset', y = 'distance', add =
   stat_compare_means(comparisons = list(c('low','high')), 
                      method = 'wilcox.test',label = "p.signif") + xlab('HSC Sca1 subset') + ylab('proximity to MkP (CD 48 low)') + scale_y_reverse() + guides(col =F)
 
-
-fig_sx1 <- (distance_boxplot_MkP / distance_boxplot_HSC) & theme(text = element_text(size =7), axis.text.y = element_blank())
-
-fig_sx1
+distance_boxplot_HSC
 ```
 
+###
 
 
 ### Vwf and CD41 expression across cell_types ###

@@ -76,7 +76,7 @@ custom_t2 <- trans_new('custom_scale2',
                       transform = 'scale_forw2', 
                       inverse = 'scale_inv2')
 
-pval_thresh = 1e-02
+pval_thresh = 5e-02
 logFC_thresh = 1
 
 # insert variation here
@@ -140,9 +140,9 @@ ranked_entrez <- ranked_d_exp$log2FoldChange
 names(ranked_entrez) <- ranked_d_exp$Entrez_ID
 
 
-deg <- d_exp %>% filter(padj <0.01)
-deg_up <- d_exp %>% filter(log2FoldChange > 0, padj <0.01)
-deg_dn <- d_exp %>% filter(log2FoldChange < 0, padj <0.01)
+deg <- d_exp %>% filter(padj < pval_thresh, abs(log2FoldChange) > logFC_thresh)
+deg_up <- deg %>% filter(log2FoldChange > 0)
+deg_dn <- deg %>% filter(log2FoldChange < 0)
 ```
 
 # MsigDB - celltype GSEA
